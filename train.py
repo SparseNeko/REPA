@@ -202,6 +202,10 @@ def main(args):
 
     model = DeltaNetForGen2D(config)
 
+    from flazoo import log_model
+
+    log_model(model)
+
     model = model.to(device)
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
