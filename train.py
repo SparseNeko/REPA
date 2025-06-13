@@ -162,14 +162,45 @@ def main(args):
         raise NotImplementedError()
     z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
-    model = SiT_models[args.model](
+
+    # model = SiT_models[args.model](
+    #     input_size=latent_size,
+    #     num_classes=args.num_classes,
+    #     use_cfg = (args.cfg_prob > 0),
+    #     z_dims = z_dims,
+    #     encoder_depth=args.encoder_depth,
+    #     **block_kwargs
+    # )
+
+    from flazoo.models.gen.delta_net.configuration_delta_net import DeltaNetGen2DConfig
+    from flazoo.models.gen.delta_net.modeling_delta_net import DeltaNetForGen2D
+
+    if args.use_attn:
+        attn_config = {
+            'layers': [int(i) for i in args.attn_layers.split(',')],
+            'num_heads': args.attn_num_heads,
+            "window_size_h": 32,
+            "window_size_w": 16,
+            "tile_size_h": 16,
+            "tile_size_w": 8,
+            "seq_len" : 4096,
+        }
+    
+    config = DeltaNetGen2DConfig(
+        num_hidden_layers=args.num_hidden_layers,
         input_size=latent_size,
+        hidden_size=args.hidden_size,
+        num_heads=args.num_heads,
+        patch_size=args.patch_size,
+        attn=attn_config,
+        attn_type=args.attn_type,
         num_classes=args.num_classes,
         use_cfg = (args.cfg_prob > 0),
         z_dims = z_dims,
         encoder_depth=args.encoder_depth,
-        **block_kwargs
     )
+
+    model = DeltaNetForGen2D(config)
 
     model = model.to(device)
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -400,6 +431,20 @@ def parse_args(input_args=None):
     parser.add_argument("--encoder-depth", type=int, default=8)
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qk-norm",  action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--num-hidden-layers", type=int, default=12)
+    parser.add_argument("--hidden-size", type=int, default=448)
+    parser.add_argument("--num-heads", type=int, default=16)
+    parser.add_argument("--use-attn", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--attn_num_heads", type=int, default=14)
+    # patch size
+    parser.add_argument("--patch-size", type=int, default=1, help="Patch size for the model. Default is 1.")
+    # attn type
+    parser.add_argument("--attn-type", type=str, default="sta2d_attn")
+    # attn_layers: str = field(default="0,1", metadata={"help": "Layers using attention"})
+    parser.add_argument("--attn_layers", type=str, default="0,2,4,6,8,10",
+                        help="Layers using attention, e.g. 0,1,2,3,4,5,6,7,8,9,10,11")
+
+
 
     # dataset
     parser.add_argument("--data-dir", type=str, default="../data/imagenet256")
