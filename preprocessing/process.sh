@@ -5,5 +5,5 @@ torchrun --nproc_per_node=8 preprocess.py \
     --dest=${TARGET_PATH}/vae-sd \
     --dest-images=${TARGET_PATH}/images \
     --batch-size=128 \
-    --resolution=256 \
+    --resolution=512 \
     --transform=center-crop-dhariwal

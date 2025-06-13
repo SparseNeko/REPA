@@ -12,4 +12,4 @@ accelerate launch train.py \
   --output-dir="exps" \
   --exp-name="linear-dinov2-b-enc8-in512-pure-dt" \
   --resolution=512 \
-  --data-dir=[YOUR_DATA_PATH]
+  --data-dir="./data/imagenet"
