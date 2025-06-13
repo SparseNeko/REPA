@@ -23,6 +23,39 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
+class ImageDataset(torch.utils.data.Dataset):
+    """Wrapper for HuggingFace dataset for image classification"""
+    def __init__(self, dataset, transform=None):
+        self.dataset = dataset
+        self.transform = transform
+        
+        # Determine image and label keys
+        if 'img' in self.dataset.column_names:
+            self.img_key = 'img'
+            self.label_key = 'fine_label' if 'fine_label' in self.dataset.column_names else 'label'
+        elif 'image' in self.dataset.column_names:
+            self.img_key = 'image'
+            self.label_key = 'label'
+        else:
+            raise ValueError("Cannot determine image and label columns in the dataset")
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        image = item[self.img_key]
+        label = item[self.label_key]
+        
+        # Ensure image is RGB format
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+            
+        if self.transform is not None:
+            image = self.transform(image)
+            
+        return image, label
+
 def center_crop(width, height, img):
     crop = np.min(img.shape[:2])
     img = img[(img.shape[0] - crop) // 2 : (img.shape[0] + crop) // 2, (img.shape[1] - crop) // 2 : (img.shape[1] + crop) // 2]
@@ -109,7 +142,10 @@ def main(args):
         ])
     else:
         raise ValueError(f"Invalid transform: {args.transform}")
-    dataset = ImageFolder(args.source, transform=transform)
+    
+    from datasets import load_dataset
+    dataset = load_dataset("imagenet-1k", split="train", trust_remote_code=True)
+    dataset = ImageDataset(dataset, transform)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
