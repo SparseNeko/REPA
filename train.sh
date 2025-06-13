@@ -1,0 +1,15 @@
+accelerate launch train.py \
+  --report-to="tensorboard" \
+  --allow-tf32 \
+  --mixed-precision="bf16" \
+  --seed=0 \
+  --path-type="linear" \
+  --prediction="v" \
+  --weighting="uniform" \
+  --enc-type="dinov2-vit-b" \
+  --proj-coeff=0.5 \
+  --encoder-depth=8 \
+  --output-dir="exps" \
+  --exp-name="linear-dinov2-b-enc8-in512-pure-dt" \
+  --resolution=512 \
+  --data-dir=[YOUR_DATA_PATH]
