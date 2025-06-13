@@ -92,7 +92,12 @@ def load_encoders(enc_type, device, resolution=256):
             else:
                 encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
             del encoder.head
-            patch_resolution = 16 * (resolution // 256)
+            # patch_resolution = 16 * (resolution // 256)
+            import logging
+            logging.warning(
+                "we are using a 2 times higher patch resolution than the original code, "
+            )
+            patch_resolution = 32 * (resolution // 256)
             encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
                 encoder.pos_embed.data, [patch_resolution, patch_resolution],
             )

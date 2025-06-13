@@ -436,10 +436,10 @@ def parse_args(input_args=None):
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qk-norm",  action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--num-hidden-layers", type=int, default=12)
-    parser.add_argument("--hidden-size", type=int, default=448)
+    parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--use-attn", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--attn_num_heads", type=int, default=14)
+    parser.add_argument("--attn_num_heads", type=int, default=16)
     # patch size
     parser.add_argument("--patch-size", type=int, default=1, help="Patch size for the model. Default is 1.")
     # attn type
