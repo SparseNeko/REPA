@@ -36,6 +36,198 @@ logger = get_logger(__name__)
 CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
 
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm() + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.T
+        B = (
+            b * A + c * A @ A
+        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - We believe this optimizer is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+
+    Arguments:
+        muon_params: The parameters to be optimized by Muon.
+        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
+        momentum: The momentum used by the internal SGD. (0.95 is a good default)
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
+        adamw_params: The parameters to be optimized by AdamW. Any parameters in `muon_params` which are
+        {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
+        adamw_lr: The learning rate for the internal AdamW.
+        adamw_betas: The betas for the internal AdamW.
+        adamw_eps: The epsilon for the internal AdamW.
+        adamw_wd: The weight decay for the internal AdamW.
+    """
+
+    def __init__(
+        self,
+        lr=1e-3,
+        wd=0.1,
+        muon_params=None,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        adamw_params=None,
+        adamw_betas=(0.9, 0.95),
+        adamw_eps=1e-8,
+    ):
+
+        defaults = dict(
+            lr=lr,
+            wd=wd,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            adamw_betas=adamw_betas,
+            adamw_eps=adamw_eps,
+        )
+
+        params = list(muon_params)
+        adamw_params = list(adamw_params) if adamw_params is not None else []
+        params.extend(adamw_params)
+        super().__init__(params, defaults)
+        # Sort parameters into those for which we will use Muon, and those for which we will not
+        for p in muon_params:
+            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
+            assert p.ndim == 2, p.ndim
+            self.state[p]["use_muon"] = True
+        for p in adamw_params:
+            # Do not use Muon for parameters in adamw_params
+            self.state[p]["use_muon"] = False
+
+    def adjust_lr_for_muon(self, lr, param_shape):
+        A, B = param_shape[:2]
+        # We adjust the learning rate and weight decay based on the size of the parameter matrix
+        # as describted in the paper
+        adjusted_ratio = 0.2 * math.sqrt(max(A, B))
+        adjusted_lr = lr * adjusted_ratio
+        return adjusted_lr
+
+    def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Args:
+            closure (Callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+
+            ############################
+            #           Muon           #
+            ############################
+
+            params = [p for p in group["params"] if self.state[p]["use_muon"]]
+            # import pdb; pdb.set_trace()
+            lr = group["lr"]
+            wd = group["wd"]
+            momentum = group["momentum"]
+
+            # generate weight updates in distributed fashion
+            for p in params:
+                # sanity check
+                g = p.grad
+                if g is None:
+                    continue
+                if g.ndim > 2:
+                    g = g.view(g.size(0), -1)
+                assert g is not None
+
+                # calc update
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if group["nesterov"]:
+                    g = g.add(buf, alpha=momentum)
+                else:
+                    g = buf
+                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+
+                # scale update
+                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
+
+                # apply weight decay
+                p.data.mul_(1 - lr * wd)
+
+                # apply update
+                p.data.add_(u, alpha=-adjusted_lr)
+
+            ############################
+            #       AdamW backup       #
+            ############################
+
+            params = [p for p in group["params"] if not self.state[p]["use_muon"]]
+            lr = group['lr']
+            beta1, beta2 = group["adamw_betas"]
+            eps = group["adamw_eps"]
+            weight_decay = group["wd"]
+
+            for p in params:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if "step" not in state:
+                    state["step"] = 0
+                    state["moment1"] = torch.zeros_like(g)
+                    state["moment2"] = torch.zeros_like(g)
+                state["step"] += 1
+                step = state["step"]
+                buf1 = state["moment1"]
+                buf2 = state["moment2"]
+                buf1.lerp_(g, 1 - beta1)
+                buf2.lerp_(g.square(), 1 - beta2)
+
+                g = buf1 / (eps + buf2.sqrt())
+
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                scale = bias_correction1 / bias_correction2**0.5
+                p.data.mul_(1 - lr * weight_decay)
+                p.data.add_(g, alpha=-lr / scale)
+
+        return loss
+
 def preprocess_raw_image(x, enc_type):
     resolution = x.shape[-1]
     if 'clip' in enc_type:
@@ -179,11 +371,11 @@ def main(args):
         attn_config = {
             'layers': [int(i) for i in args.attn_layers.split(',')],
             'num_heads': args.attn_num_heads,
-            "window_size_h": 32,
-            "window_size_w": 16,
-            "tile_size_h": 16,
+            "window_size_h": 24,
+            "window_size_w": 24,
+            "tile_size_h": 8,
             "tile_size_w": 8,
-            "seq_len" : 4096,
+            "seq_len" : 1024,
         }
     
     config = DeltaNetGen2DConfig(
@@ -197,6 +389,7 @@ def main(args):
         num_classes=args.num_classes,
         use_cfg = (args.cfg_prob > 0),
         z_dims = z_dims,
+        decoder_hidden_size=args.hidden_size,
         encoder_depth=args.encoder_depth,
     )
 
@@ -236,14 +429,36 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    # optimizer = torch.optim.AdamW(
+    #     model.parameters(),
+    #     lr=args.learning_rate,
+    #     betas=(args.adam_beta1, args.adam_beta2),
+    #     weight_decay=args.adam_weight_decay,
+    #     eps=args.adam_epsilon,
+    # )
+
+    muon_params = [p for name, p in model.named_parameters() if p.ndim == 2]
+
+    adam_params = [p for name, p in model.named_parameters() if p.ndim != 2]
+
+    optimizer = Muon(
         lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )    
-    
+        wd=args.adam_weight_decay,
+        muon_params=muon_params,
+        adamw_params=adam_params,
+    )
+
+    from pytorch_optimizer.lr_scheduler import CosineScheduler
+
+    lr_scheduler = CosineScheduler(
+        optimizer,
+        warmup_steps=15000,
+        t_max=args.max_train_steps,
+        max_lr=args.learning_rate,
+        min_lr=5e-5,
+        init_lr=5e-6,
+    )
+
     # Setup data:
     train_dataset = CustomDataset(args.data_dir)
     local_batch_size = int(args.batch_size // accelerator.num_processes)
@@ -276,8 +491,8 @@ def main(args):
         optimizer.load_state_dict(ckpt['opt'])
         global_step = ckpt['steps']
 
-    model, optimizer, train_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
     )
 
     if accelerator.is_main_process:
@@ -352,6 +567,7 @@ def main(args):
                     grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                lr_scheduler.step()
 
                 if accelerator.sync_gradients:
                     update_ema(ema, model) # change ema function
@@ -373,6 +589,19 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
+                    # save hf pretrained model
+                    hf_model_path = f"{save_dir}/hf_model/{global_step:07d}"
+                    os.makedirs(hf_model_path, exist_ok=True)
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    unwrapped_model.save_pretrained(hf_model_path)
+                    # save ema model
+                    ema_hf_model_path = f"{save_dir}/hf_model/ema-{global_step:07d}"
+                    os.makedirs(ema_hf_model_path, exist_ok=True)
+                    ema.save_pretrained(ema_hf_model_path)
+                    logger.info(f"Saved HF model to {hf_model_path} and EMA model to {ema_hf_model_path}")
+                    
+            accelerator.wait_for_everyone()
+
             if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)):
                 from samplers import euler_sampler
                 with torch.no_grad():
@@ -393,14 +622,40 @@ def main(args):
                     gt_samples = (gt_samples + 1) / 2.
                 out_samples = accelerator.gather(samples.to(torch.float32))
                 gt_samples = accelerator.gather(gt_samples.to(torch.float32))
-                accelerator.log({"samples": wandb.Image(array2grid(out_samples)),
-                                 "gt_samples": wandb.Image(array2grid(gt_samples))})
+                # accelerator.log({"samples": wandb.Image(array2grid(out_samples)),
+                #                  "gt_samples": wandb.Image(array2grid(gt_samples))})
+                if accelerator.is_main_process:
+                    samples_dir = os.path.join(save_dir, "samples")
+                    os.makedirs(samples_dir, exist_ok=True)
+
+                    from PIL import Image
+                    
+                    out_samples_cpu = out_samples.detach().cpu()
+                    gt_samples_cpu = gt_samples.detach().cpu()
+                    
+                    sample_grid = array2grid(out_samples_cpu)
+                    gt_grid = array2grid(gt_samples_cpu)
+                    
+                    sample_img = Image.fromarray(sample_grid, mode='RGB')
+                    gt_img = Image.fromarray(gt_grid, mode='RGB')
+                    
+                    sample_img.save(
+                        os.path.join(samples_dir, f"samples_step_{global_step:07d}.png")
+                    )
+                    gt_img.save(
+                        os.path.join(samples_dir, f"gt_samples_step_{global_step:07d}.png")
+                    )
+                    
+                    logging.info(f"Samples saved to {samples_dir}")
+
+                accelerator.wait_for_everyone()
                 logging.info("Generating EMA samples done.")
 
             logs = {
                 "loss": accelerator.gather(loss_mean).mean().detach().item(), 
                 "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
-                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
+                "grad_norm": accelerator.gather(grad_norm).mean().detach().item() if accelerator.sync_gradients else 0.0,
+                "lr": lr_scheduler.get_lr(),
             }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -413,6 +668,15 @@ def main(args):
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
     
+    accelerator.wait_for_everyone()
+
+    # save last model hf
+    if accelerator.is_main_process:
+        hf_model_path = f"{save_dir}/hf_model/last"
+        os.makedirs(hf_model_path, exist_ok=True)
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.save_pretrained(hf_model_path)
+
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         logger.info("Done!")
@@ -439,9 +703,9 @@ def parse_args(input_args=None):
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--use-attn", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--attn_num_heads", type=int, default=16)
+    parser.add_argument("--attn-num-heads", type=int, default=16)
     # patch size
-    parser.add_argument("--patch-size", type=int, default=1, help="Patch size for the model. Default is 1.")
+    parser.add_argument("--patch-size", type=int, default=2, help="Patch size for the model. Default is 2.")
     # attn type
     parser.add_argument("--attn-type", type=str, default="sta2d_attn")
     # attn_layers: str = field(default="0,1", metadata={"help": "Layers using attention"})
@@ -461,7 +725,7 @@ def parse_args(input_args=None):
 
     # optimization
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--max-train-steps", type=int, default=400000)
+    parser.add_argument("--max-train-steps", type=int, default=200000)
     parser.add_argument("--checkpointing-steps", type=int, default=50000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -475,7 +739,7 @@ def parse_args(input_args=None):
     parser.add_argument("--seed", type=int, default=0)
 
     # cpu
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=16)
 
     # loss
     parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])
