@@ -61,29 +61,31 @@ def main(args):
     # Load model:
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
     latent_size = args.resolution // 8
-    model = SiT_models[args.model](
-        input_size=latent_size,
-        num_classes=args.num_classes,
-        use_cfg = True,
-        z_dims = [int(z_dim) for z_dim in args.projector_embed_dims.split(',')],
-        encoder_depth=args.encoder_depth,
-        **block_kwargs,
-    ).to(device)
+    # model = SiT_models[args.model](
+    #     input_size=latent_size,
+    #     num_classes=args.num_classes,
+    #     use_cfg = True,
+    #     z_dims = [int(z_dim) for z_dim in args.projector_embed_dims.split(',')],
+    #     encoder_depth=args.encoder_depth,
+    #     **block_kwargs,
+    # ).to(device)
+    from flazoo.models.gen.delta_net.modeling_delta_net import DeltaNetForGen2D
+    model = DeltaNetForGen2D.from_pretrained("exps/linear-dinov2-b-enc8-in512-sta242488-dt/hf_model/0300000").to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
-    ckpt_path = args.ckpt
-    if ckpt_path is None:
-        args.ckpt = 'SiT-XL-2-256x256.pt'
-        assert args.model == 'SiT-XL/2'
-        assert len(args.projector_embed_dims.split(',')) == 1
-        assert int(args.projector_embed_dims.split(',')[0]) == 768
-        state_dict = download_model('last.pt')
-    else:
-        state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}')['ema']
-    if args.legacy:
-        state_dict = load_legacy_checkpoints(
-            state_dict=state_dict, encoder_depth=args.encoder_depth
-            )
-    model.load_state_dict(state_dict)
+    # ckpt_path = args.ckpt
+    # if ckpt_path is None:
+    #     args.ckpt = 'SiT-XL-2-256x256.pt'
+    #     assert args.model == 'SiT-XL/2'
+    #     assert len(args.projector_embed_dims.split(',')) == 1
+    #     assert int(args.projector_embed_dims.split(',')[0]) == 768
+    #     state_dict = download_model('last.pt')
+    # else:
+    #     state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}')['ema']
+    # if args.legacy:
+    #     state_dict = load_legacy_checkpoints(
+    #         state_dict=state_dict, encoder_depth=args.encoder_depth
+    #         )
+    # model.load_state_dict(state_dict)
     model.eval()  # important!
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
@@ -185,7 +187,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--encoder-depth", type=int, default=8)
-    parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--resolution", type=int, choices=[256, 512], default=512)
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=False)
 
@@ -193,7 +195,7 @@ if __name__ == "__main__":
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
 
     # number of samples
-    parser.add_argument("--per-proc-batch-size", type=int, default=32)
+    parser.add_argument("--per-proc-batch-size", type=int, default=16)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
 
     # sampling related hyperparameters

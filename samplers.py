@@ -73,9 +73,13 @@ def euler_sampler(
                 y_cur = y            
             kwargs = dict(y=y_cur)
             time_input = torch.ones(model_input.size(0)).to(device=device, dtype=torch.float64) * t_cur
-            d_cur = model(
-                model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
-                )[0].to(torch.float64)
+
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True):
+                # compute drift
+                d_cur = model(
+                    model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
+                    )[0].to(torch.float64)
+                
             if cfg_scale > 1. and t_cur <= guidance_high and t_cur >= guidance_low:
                 d_cur_cond, d_cur_uncond = d_cur.chunk(2)
                 d_cur = d_cur_uncond + cfg_scale * (d_cur_cond - d_cur_uncond)                
@@ -91,9 +95,10 @@ def euler_sampler(
                 time_input = torch.ones(model_input.size(0)).to(
                     device=model_input.device, dtype=torch.float64
                     ) * t_next
-                d_prime = model(
-                    model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
-                    )[0].to(torch.float64)
+                with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True):
+                    d_prime = model(
+                        model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
+                        )[0].to(torch.float64)
                 if cfg_scale > 1.0 and t_cur <= guidance_high and t_cur >= guidance_low:
                     d_prime_cond, d_prime_uncond = d_prime.chunk(2)
                     d_prime = d_prime_uncond + cfg_scale * (d_prime_cond - d_prime_uncond)
@@ -140,10 +145,11 @@ def euler_maruyama_sampler(
             eps_i = torch.randn_like(x_cur).to(device)
             deps = eps_i * torch.sqrt(torch.abs(dt))
 
-            # compute drift
-            v_cur = model(
-                model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
-                )[0].to(torch.float64)
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True):
+                # compute drift
+                v_cur = model(
+                    model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
+                    )[0].to(torch.float64)
             s_cur = get_score_from_velocity(v_cur, model_input, time_input, path_type=path_type)
             d_cur = v_cur - 0.5 * diffusion * s_cur
             if cfg_scale > 1. and t_cur <= guidance_high and t_cur >= guidance_low:
@@ -168,9 +174,10 @@ def euler_maruyama_sampler(
         ) * t_cur
     
     # compute drift
-    v_cur = model(
-        model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
-        )[0].to(torch.float64)
+    with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True):
+        v_cur = model(
+            model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
+            )[0].to(torch.float64)
     s_cur = get_score_from_velocity(v_cur, model_input, time_input, path_type=path_type)
     diffusion = compute_diffusion(t_cur)
     d_cur = v_cur - 0.5 * diffusion * s_cur
